@@ -25,11 +25,22 @@ input:focus-visible,button:focus-visible{outline:3px solid var(--accent);outline
 .slot:disabled{opacity:.4;text-decoration:line-through;cursor:not-allowed}
 .btn{padding:10px 18px;border:0;border-radius:6px;background:var(--accent);color:var(--accent-ink);font:600 16px inherit;cursor:pointer}
 .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+.btn.small{padding:6px 12px;font-size:14px}
 .btn:disabled{opacity:.5;cursor:wait}
 #msg{min-height:1.5em;margin:12px 0 0;color:var(--bad)}
 #confirm{background:var(--ok-bg);display:none}
 #confirm dl{display:grid;grid-template-columns:auto 1fr;gap:4px 16px;margin:0 0 14px}
 #confirm dt{color:var(--muted)}#confirm dd{margin:0;word-break:break-all}
+.lookup{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+.lookup>div{flex:1 1 240px}
+#lookupMsg{min-height:1.5em;margin:12px 0 0;color:var(--muted)}
+#lookupMsg.err{color:var(--bad)}
+.results{list-style:none;margin:0 0 12px;padding:0;display:grid;gap:10px}
+.results li{border:1px solid var(--line);border-radius:8px;padding:12px 14px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center}
+.results .when{font-weight:600}
+.results .meta{color:var(--muted);font-size:14px;word-break:break-all}
+.badge{display:inline-block;padding:2px 10px;border-radius:99px;font-size:13px;font-weight:600;background:var(--ok-bg);margin-left:8px}
+.badge.cancelled{background:transparent;border:1px solid var(--line);color:var(--muted)}
 </style>
 </head>
 <body>
@@ -63,11 +74,23 @@ input:focus-visible,button:focus-visible{outline:3px solid var(--accent);outline
     <dl id="details"></dl>
     <button class="btn ghost" id="cancel">Cancel this booking</button>
   </section>
+
+  <section>
+    <h2>Find my bookings</h2>
+    <div class="lookup">
+      <div><label for="lookup">Email used when booking</label><input id="lookup" type="email" autocomplete="email" placeholder="ada@example.com"></div>
+      <button class="btn" id="search">Search</button>
+    </div>
+    <p id="lookupMsg" role="status"></p>
+    <ul class="results" id="results"></ul>
+    <button class="btn ghost" id="more" style="display:none">Load more</button>
+  </section>
 </main>
 <script>
 const $ = id => document.getElementById(id);
 const fmt = (d, o) => new Date(d).toLocaleString(undefined, o);
 let selected = null, current = null, idemKey = null;
+let slotMap = {}, lookupEmail = '', nextCursor = null, shown = 0;
 
 $('key').value = sessionStorage.getItem('key') || '';
 $('key').addEventListener('change', () => { sessionStorage.setItem('key', $('key').value.trim()); loadSlots(); });
@@ -83,6 +106,7 @@ async function loadSlots() {
   const box = $('slots');
   try {
     const { slots } = await api('/api/v1/slots');
+    slotMap = Object.fromEntries(slots.map(s => [s.id, s]));
     const providers = new Set(slots.map(s => s.provider));
     const days = {};
     slots.filter(s => new Date(s.start) > new Date())
@@ -118,6 +142,7 @@ $('book').onclick = async () => {
     const b = await api('/api/v1/bookings', { method: 'POST', headers: { 'Idempotency-Key': idemKey },
       body: JSON.stringify({ slot_id: slot.id, name: $('name').value, email: $('email').value }) });
     current = { ...b, slot };
+    if (!$('lookup').value) $('lookup').value = b.email;
     showConfirmation(current); selected = null; idemKey = null; $('chosen').textContent = 'No time selected.'; loadSlots();
   } catch (e) {
     $('msg').textContent = e.status === 409 ? 'Someone just took that time. Pick another one.'
@@ -142,6 +167,68 @@ $('cancel').onclick = async () => {
   try { const b = await api('/api/v1/bookings/' + current.id, { method: 'DELETE' }); current = { ...current, ...b }; showConfirmation(current); loadSlots(); }
   catch (e) { $('msg').textContent = e.message; }
 };
+
+// ---- Find my bookings: search by email, newest pages loaded with the cursor ----
+function setLookupMsg(text, isError) {
+  $('lookupMsg').textContent = text;
+  $('lookupMsg').className = isError ? 'err' : '';
+}
+
+function addResult(b) {
+  const slot = slotMap[b.slot_id];
+  const li = document.createElement('li');
+  const info = document.createElement('div');
+  const when = document.createElement('div'); when.className = 'when';
+  when.textContent = slot ? fmt(slot.start, { dateStyle: 'full', timeStyle: 'short' }) : 'Slot ' + b.slot_id;
+  const badge = document.createElement('span'); badge.className = 'badge ' + b.status; badge.textContent = b.status;
+  when.append(badge);
+  const meta = document.createElement('div'); meta.className = 'meta';
+  meta.textContent = (slot && slot.provider ? slot.provider + ' · ' : '') + b.name + ' · Ref ' + b.id;
+  info.append(when, meta);
+  li.append(info);
+  if (b.status === 'confirmed') {
+    const btn = document.createElement('button');
+    btn.className = 'btn ghost small'; btn.textContent = 'Cancel';
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        await api('/api/v1/bookings/' + b.id, { method: 'DELETE' });
+        badge.textContent = 'cancelled'; badge.className = 'badge cancelled'; btn.remove();
+        loadSlots();
+      } catch (e) { btn.disabled = false; setLookupMsg(e.message, true); }
+    };
+    li.append(btn);
+  }
+  $('results').append(li);
+}
+
+async function search(more) {
+  const typed = $('lookup').value.trim();
+  if (!more) {
+    if (!typed) return setLookupMsg('Enter the email you booked with.', true);
+    lookupEmail = typed; nextCursor = null; shown = 0; $('results').innerHTML = ''; $('more').style.display = 'none';
+  }
+  $('search').disabled = true; $('more').disabled = true;
+  setLookupMsg('Searching…');
+  try {
+    if (!Object.keys(slotMap).length || !more) {
+      const { slots } = await api('/api/v1/slots');
+      slotMap = Object.fromEntries(slots.map(s => [s.id, s]));
+    }
+    const q = new URLSearchParams({ email: lookupEmail, limit: '5' });
+    if (more && nextCursor) q.set('cursor', nextCursor);
+    const { bookings, next_cursor } = await api('/api/v1/bookings?' + q);
+    bookings.forEach(addResult);
+    shown += bookings.length; nextCursor = next_cursor;
+    setLookupMsg(shown ? 'Showing ' + shown + ' booking' + (shown === 1 ? '' : 's') + (nextCursor ? ' so far.' : '.') : 'No bookings found for that email.');
+    $('more').style.display = nextCursor ? '' : 'none';
+  } catch (e) {
+    setLookupMsg(e.status === 401 ? 'Enter a valid API key at the top first.' : e.message, true);
+  } finally { $('search').disabled = false; $('more').disabled = false; }
+}
+$('search').onclick = () => search(false);
+$('more').onclick = () => search(true);
+$('lookup').addEventListener('keydown', e => { if (e.key === 'Enter') search(false); });
 
 if ($('key').value) loadSlots();
 </script>
